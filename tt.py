@@ -7,3 +7,8 @@ gpu_count = torch.cuda.device_count()
 for i in range(gpu_count):
     props = torch.cuda.get_device_properties(i)
     print(f"GPU {i}：名称 = {props.name}, 显存大小 = {props.total_memory / (1024**3):.2f} GB")
+
+print("PyTorch 版本：", torch.__version__)
+
+s = '①'
+print(s.isnumeric())

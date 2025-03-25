@@ -11,8 +11,9 @@ from tqdm import tqdm   # Progress bar utilities
 import re              # For text normalization
 import os
 import matplotlib.pyplot as plt
+import logging
 from torch.cuda.amp import GradScaler, autocast  # 用于混合精度训练
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 SYSTEM_PROMPT = """
 You are a helpful and harmless assistant. You are Qwen developed by Alibaba. You should think step-by-step. You should output in a format similar to <think>...</think><answer>...</answer>, where <think> contains the reasoning process and <answer> contains the final answer. Return final answer within \\boxed{}, after taking modulo 1000. 
 """
@@ -34,20 +35,6 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     # Disable cuDNN's auto-tuner for consistent behavior
     torch.backends.cudnn.benchmark = False
-
-def build_prompt(text):
-    """
-    Creates a standardized prompt for emotion classification.
-
-    Args:
-        text (str): Input text to classify
-
-    Returns:
-        str: Formatted prompt for the model
-    """
-    # Format the input text into a consistent prompt structure
-    # Include explicit task instruction and expected output format
-    return f"Predict the emotion for the following text: {text}\nEmotion:"
 
 def encode_text(tokenizer, text, return_tensor=False):
     """
@@ -337,7 +324,7 @@ def download_and_prepare_data(url, tokenizer, batch_size, test_ratio=0.1):
     """
 
     # Load and split dataset
-    train_json = load_and_split_dataset_from_single_source(url)
+    train_json = load_dataset_from_single_source(url)
 
     # # Download compressed dataset
     # response = requests.get(data_url)
@@ -354,16 +341,40 @@ def download_and_prepare_data(url, tokenizer, batch_size, test_ratio=0.1):
 
     train_data = []
     for entry in train_json:
+        # train_data.append({
+        #     "prompt": build_prompt(entry['text']),
+        #     "completion": entry["label"].strip()
+        # })
+        answer = entry["answer"].strip()
+
+        try:
+            
+            answer = int(answer) % 1000
+            answer = str(answer)
+        except:
+            logging.error(f"Error in answer: {answer}")
+            
+            print("====================================")
+            print(answer.isdigit())
+            print(type(answer))
+            print('answer:', answer)
+            print(entry["prompt"])
+            print(type(entry["think"]))
+            print(type(entry["answer"]))
+            continue
+
+        if not isinstance(entry['prompt'], str):
+            continue
+        
+        # print("="*50)
+        # print("content:", entry)
         train_data.append({
-            "prompt": build_prompt(entry['text']),
-            "completion": entry["label"].strip()
-        })
-        train_data.append({
-            "prompt": [
+            "prompt": build_prompt([
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": entry["prompt"]}
-            ],
-            "completion": "<think>" + entry["think"] + "</think>\n<answer>" + entry["answer"] + f". So the mod 1000 answer is \\boxed{" + str(int(entry["answer"]%1000)) + "}</answer>"
+            ]),
+            "completion": f"<think>{entry['think']}</think>\n" \
+                  f"<answer>{entry['answer']}. So the mod 1000 answer is \\boxed{{{str(answer)}}}</answer>"
         })
 
 
@@ -388,6 +399,14 @@ def download_and_prepare_data(url, tokenizer, batch_size, test_ratio=0.1):
 
     return train_loader
 
+def build_prompt(messages):
+    """
+    Build a single prompt string from a list of messages.
+    Each message is expected to be a dictionary with 'role' and 'content' keys.
+    This function concatenates all message contents, preserving the training format.
+    """
+    # print('messages:', messages)
+    return "\n".join([msg["content"].strip() for msg in messages])
 
 
 def get_hyperparameters():
@@ -486,7 +505,7 @@ if __name__ == "__main__":
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
 
         # Process each batch
-        record_batch_step = 1000
+        record_batch_step = 1
         for input_ids, attention_mask, labels, _, _ in progress_bar:
             # Move batch data to appropriate device
             input_ids = input_ids.to(device)
