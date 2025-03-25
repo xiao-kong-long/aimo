@@ -186,6 +186,18 @@ def normalize_text(text):
     text = re.sub(r'\s+', ' ', text)
     return text
 
+
+def extract_boxed_text(text):
+    pattern = r'oxed{(.*?)}'
+    matches = re.findall(pattern, text)
+    if not matches:
+        return ""
+    for match in matches[::-1]:
+        if match != "":
+            return match
+    return ""
+
+
 def calculate_accuracy(model, tokenizer, loader):
     """
     Calculates prediction accuracy on a dataset.
@@ -213,8 +225,12 @@ def calculate_accuracy(model, tokenizer, loader):
                 # Generate model's prediction for this prompt
                 generated_text = generate_text(model, tokenizer, prompt)
                 # Compare normalized versions of prediction and expected completion
-                if normalize_text(generated_text) == normalize_text(expected_completion):
+                generated_result = extract_boxed_text(generated_text)
+                expected_result = extract_boxed_text(expected_completion)
+                if generated_result == expected_result:
                     correct += 1
+                # if normalize_text(generated_text) == normalize_text(expected_completion):
+                    # correct += 1
                 total += 1
 
     # Calculate accuracy, handling empty dataset case
@@ -269,6 +285,13 @@ def test_model(model_path, test_input):
 
     # Load saved model and move to appropriate device
     model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
+
+    if torch.cuda.device_count() > 1:
+        print('--------------------------------HAHAHA--------------------------------')
+        model = torch.nn.DataParallel(model)
+        # model.to(device)
+    
+
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     # Ensure model has proper padding token configuration
@@ -352,15 +375,15 @@ def download_and_prepare_data(url, tokenizer, batch_size, test_ratio=0.1):
             answer = int(answer) % 1000
             answer = str(answer)
         except:
-            logging.error(f"Error in answer: {answer}")
+            # logging.error(f"Error in answer: {answer}")
             
-            print("====================================")
-            print(answer.isdigit())
-            print(type(answer))
-            print('answer:', answer)
-            print(entry["prompt"])
-            print(type(entry["think"]))
-            print(type(entry["answer"]))
+            # print("====================================")
+            # print(answer.isdigit())
+            # print(type(answer))
+            # print('answer:', answer)
+            # print(entry["prompt"])
+            # print(type(entry["think"]))
+            # print(type(entry["answer"]))
             continue
 
         if not isinstance(entry['prompt'], str):
@@ -419,7 +442,7 @@ def get_hyperparameters():
     # Training for 2 epochs as a balance of learning and efficiency
     num_epochs = 2
     # Batch size of 16 works well with most GPU memory sizes
-    batch_size = 16
+    batch_size = 4
     # Standard learning rate for fine-tuning transformers
     learning_rate = 5e-5
 
@@ -458,6 +481,11 @@ if __name__ == "__main__":
     gradient_accumulation_steps = 8
     scaler = GradScaler()  # 初始化混合精度的梯度缩放器
 
+    torch.backends.cuda.enable_flash_sdp(True)  # 启用FlashAttention（如果可用）
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+
+
     # Set random seeds for reproducibility
     set_seed(42)
 
@@ -466,7 +494,7 @@ if __name__ == "__main__":
     model_name = "DeepSeek-R1-Distill-Qwen-7B"
 
     is_soretd = False
-    if is_soretd:
+    if not is_soretd:
         train_url = "math_data/V1_filtered/train_data_filtered.jsonl"
         test_large_url = "math_data/V1_filtered/test_large_data_filtered.jsonl"
         test_small_url = "math_data/V1_filtered/test_small_data_filtered.jsonl"
@@ -478,12 +506,26 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # Load pre-trained model and move to appropriate device
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,  # 使用 float16 数据类型
+        device_map=None,
+        trust_remote_code=True  # 信任远程模型代码
+    ).to(device)
+
+    if torch.cuda.device_count() > 1:
+        print('--------------------------------HAHAHA--------------------------------')
+        model = torch.nn.DataParallel(model, device_ids=[0, 1])
+        print(next(model.parameters()).device)  # 应输出 "cuda:0"
+        print(torch.cuda.memory_allocated(0))  # 查看 GPU 0 显存占用
+        print(torch.cuda.memory_allocated(1))  # 查看 GPU 1 显存占用
+    
+    # model.to(device)
+
     # Initialize tokenizer and configure padding token
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
-
-    # Load pre-trained model and move to appropriate device
-    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
     # Get training hyperparameters
     num_epochs, batch_size, learning_rate = get_hyperparameters()
@@ -518,7 +560,7 @@ if __name__ == "__main__":
                 attention_mask=attention_mask,
                 labels=labels
             )
-            loss = outputs.loss
+            loss = outputs.loss.mean()  # 计算平均损失
 
             # # Backward pass and optimization
             loss.backward()
