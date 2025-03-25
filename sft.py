@@ -11,6 +11,11 @@ from tqdm import tqdm   # Progress bar utilities
 import re              # For text normalization
 import os
 import matplotlib.pyplot as plt
+from torch.cuda.amp import GradScaler, autocast  # 用于混合精度训练
+
+SYSTEM_PROMPT = """
+You are a helpful and harmless assistant. You are Qwen developed by Alibaba. You should think step-by-step. You should output in a format similar to <think>...</think><answer>...</answer>, where <think> contains the reasoning process and <answer> contains the final answer. Return final answer within \\boxed{}, after taking modulo 1000. 
+"""
 
 def set_seed(seed):
     """
@@ -313,7 +318,11 @@ def load_and_split_dataset_from_different_source(train_url, test_url):
     test_dataset = read_jsonl_file(test_url)
     return train_dataset, test_dataset
 
-def download_and_prepare_data(train_url, test_url, tokenizer, batch_size, test_ratio=0.1):
+def load_dataset_from_single_source(url):
+    dataset = read_jsonl_file(url)
+    return dataset
+
+def download_and_prepare_data(url, tokenizer, batch_size, test_ratio=0.1):
     """
     Downloads and prepares dataset for training.
 
@@ -328,7 +337,7 @@ def download_and_prepare_data(train_url, test_url, tokenizer, batch_size, test_r
     """
 
     # Load and split dataset
-    train_json, test_json = load_and_split_dataset_from_different_source(train_url, test_url)
+    train_json = load_and_split_dataset_from_single_source(url)
 
     # # Download compressed dataset
     # response = requests.get(data_url)
@@ -344,16 +353,17 @@ def download_and_prepare_data(train_url, test_url, tokenizer, batch_size, test_r
     #     })
 
     train_data = []
-    test_data = []
     for entry in train_json:
         train_data.append({
             "prompt": build_prompt(entry['text']),
             "completion": entry["label"].strip()
         })
-    for entry in test_json:
-        test_data.append({
-            "prompt": build_prompt(entry['text']),
-            "completion": entry["label"].strip()
+        train_data.append({
+            "prompt": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": entry["prompt"]}
+            ],
+            "completion": "<think>" + entry["think"] + "</think>\n<answer>" + entry["answer"] + f". So the mod 1000 answer is \\boxed{" + str(int(entry["answer"]%1000)) + "}</answer>"
         })
 
 
@@ -367,7 +377,6 @@ def download_and_prepare_data(train_url, test_url, tokenizer, batch_size, test_r
 
     # Create dataset objects
     train_dataset = PromptCompletionDataset(train_data, tokenizer)
-    test_dataset = PromptCompletionDataset(test_data, tokenizer)
 
     # Create data loaders with appropriate settings
     train_loader = DataLoader(
@@ -376,14 +385,8 @@ def download_and_prepare_data(train_url, test_url, tokenizer, batch_size, test_r
         shuffle=True,         # Shuffle training data
         collate_fn=lambda batch: collate_fn(batch, tokenizer)  # Custom collation for padding
     )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,        # Don't shuffle test data
-        collate_fn=lambda batch: collate_fn(batch, tokenizer)
-    )
 
-    return train_loader, test_loader
+    return train_loader
 
 
 
@@ -432,15 +435,27 @@ if __name__ == "__main__":
     accuracies = []
     batches = []
 
+    # 设置梯度累积步数和混合精度
+    gradient_accumulation_steps = 8
+    scaler = GradScaler()  # 初始化混合精度的梯度缩放器
+
     # Set random seeds for reproducibility
     set_seed(42)
 
     # Configure basic training parameters
     # Configure training parameters
-    train_url = "data/tagmynews3/train.jsonl"
-    test_url = "data/tagmynews3/dev.jsonl"
-    model_name = "local_model/gpt2"
-    # model_name = "/home/weidu/huqifeng/llm/InternLM2/autodl-tmp/Shanghai_AI_Laboratory/internlm2-chat-7b"
+    model_name = "DeepSeek-R1-Distill-Qwen-7B"
+
+    is_soretd = False
+    if is_soretd:
+        train_url = "math_data/V1_filtered/train_data_filtered.jsonl"
+        test_large_url = "math_data/V1_filtered/test_large_data_filtered.jsonl"
+        test_small_url = "math_data/V1_filtered/test_small_data_filtered.jsonl"
+    else:
+        train_url = "math_data/V2_sorted/train_data_filtered_sorted.jsonl"
+        test_large_url = "math_data/V2_sorted/test_large_data_filtered_sorted.jsonl"
+        test_small_url = "math_data/V2_sorted/test_small_data_filtered_sorted.jsonl"
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -455,7 +470,9 @@ if __name__ == "__main__":
     num_epochs, batch_size, learning_rate = get_hyperparameters()
 
     # Load and prepare training data
-    train_loader, test_loader = download_and_prepare_data(train_url, test_url, tokenizer, batch_size)
+    train_loader = download_and_prepare_data(train_url, tokenizer, batch_size)
+    train_large_loader = download_and_prepare_data(test_large_url, tokenizer, batch_size)
+    train_small_loader = download_and_prepare_data(test_small_url, tokenizer, batch_size)
 
     # Initialize optimizer with learning rate
     optimizer = AdamW(model.parameters(), lr=learning_rate)
@@ -469,7 +486,7 @@ if __name__ == "__main__":
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
 
         # Process each batch
-        record_batch_step = 1
+        record_batch_step = 1000
         for input_ids, attention_mask, labels, _, _ in progress_bar:
             # Move batch data to appropriate device
             input_ids = input_ids.to(device)
@@ -484,7 +501,7 @@ if __name__ == "__main__":
             )
             loss = outputs.loss
 
-            # Backward pass and optimization
+            # # Backward pass and optimization
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -493,20 +510,17 @@ if __name__ == "__main__":
             total_loss += loss.item()
             num_batches += 1
 
-            # Update progress metrics
-            total_loss += loss.item()
-
             if num_batches % record_batch_step == 0:
-                test_acc = calculate_accuracy(model, tokenizer, test_loader)
-                print(f"Epoch {epoch+1} Batch {num_batches} - Loss: {loss.item():.4f}, Test accuracy: {test_acc:.4f}")
-                checkpoint_path = f"finetuned_model/gpt2_generation_full/{epoch+1}_{num_batches}"
+                test_small_acc = calculate_accuracy(model, tokenizer, test_small_loader)
+                print(f"Epoch {epoch+1} Batch {num_batches} - Loss: {loss.item():.4f}, Test Small accuracy: {test_small_acc:.4f}")
+                checkpoint_path = f"finetuned_model/deepseek-sft/{epoch+1}_{num_batches}"
                 os.makedirs(checkpoint_path, exist_ok=True)
                 model.save_pretrained(checkpoint_path)
                 tokenizer.save_pretrained(checkpoint_path)
 
                 # 保存损失和准确率数据
                 losses.append(loss.item())
-                accuracies.append(test_acc)
+                accuracies.append(test_small_acc)
                 batches.append(num_batches)
 
                 # 更新实时绘图
@@ -517,24 +531,20 @@ if __name__ == "__main__":
 
         # Calculate and display epoch metrics
         avg_loss = total_loss / num_batches
-        test_acc = calculate_accuracy(model, tokenizer, test_loader)
+        test_small_acc = calculate_accuracy(model, tokenizer, test_small_loader)
+        test_large_acc = calculate_accuracy(model, tokenizer, test_large_loader)
         print("="*50)
-        print(f"Epoch {epoch+1} - Average loss: {avg_loss:.4f}, Test accuracy: {test_acc:.4f}")
+        print(f"Epoch {epoch+1} - Average loss: {avg_loss:.4f}, Test Small accuracy: {test_small_acc:.4f}, Test Large accuracy: {test_large_acc:.4f}")
 
     # Calculate final model performance
     train_acc = calculate_accuracy(model, tokenizer, train_loader)
     print(f"Training accuracy: {train_acc:.4f}")
-    print(f"Test accuracy: {test_acc:.4f}")
 
     # Save the trained model and tokenizer
-    final_checkpoint_path = "finetuned_model/gpt2_generation_full/final"
+    final_checkpoint_path = "finetuned_model/deepseek-sft/final"
     os.makedirs(final_checkpoint_path, exist_ok=True)
     model.save_pretrained(final_checkpoint_path)
     tokenizer.save_pretrained(final_checkpoint_path)
-
-    # Test model with a sample input
-    test_input = "I'm so happy to be able to finetune an LLM!"
-    test_model(final_checkpoint_path, test_input)
 
     # 显示最终图像
     plt.show()
