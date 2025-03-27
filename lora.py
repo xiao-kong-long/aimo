@@ -6,7 +6,7 @@ from torch.optim import AdamW    # Optimizer for training
 from tqdm import tqdm   # Progress bar utilities
 import os
 
-from sft import set_seed, get_hyperparameters, download_and_prepare_data, calculate_accuracy, test_model
+from aimo.sft import set_seed, get_hyperparameters, download_and_prepare_data, calculate_accuracy, test_model
 
 # Main training script
 if __name__ == "__main__":

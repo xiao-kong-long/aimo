@@ -7,8 +7,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import os
 
-MODEL_NAME = "DeepSeek-R1-Distill-Qwen-7B"  # 可以换成任意支持的模型
-# MODEL_NAME = "gpt2"
+# MODEL_NAME = "DeepSeek-R1-Distill-Qwen-7B"  # 可以换成任意支持的模型
+MODEL_NAME = "gpt2"
 
 SYSTEM_PROMPT = """
 You are a helpful and harmless assistant. You are Qwen developed by Alibaba. You should think step-by-step. You should output in a format similar to <think>...</think><answer>...</answer>, where <think> contains the reasoning process and <answer> contains the final answer. Return final answer within \\boxed{}, after taking modulo 1000. 
@@ -94,3 +94,9 @@ trainer = Trainer(
 
 # 启动训练
 trainer.train()
+
+# Save the trained model and tokenizer
+final_checkpoint_path = "finetuned_model/deepseek-sft/final"
+os.makedirs(final_checkpoint_path, exist_ok=True)
+model.save_pretrained(final_checkpoint_path)
+tokenizer.save_pretrained(final_checkpoint_path)

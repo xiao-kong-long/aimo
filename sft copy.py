@@ -14,7 +14,6 @@ import matplotlib.pyplot as plt
 import logging
 from torch.cuda.amp import GradScaler, autocast  # 用于混合精度训练
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-
 SYSTEM_PROMPT = """
 You are a helpful and harmless assistant. You are Qwen developed by Alibaba. You should think step-by-step. You should output in a format similar to <think>...</think><answer>...</answer>, where <think> contains the reasoning process and <answer> contains the final answer. Return final answer within \\boxed{}, after taking modulo 1000. 
 """
@@ -187,18 +186,6 @@ def normalize_text(text):
     text = re.sub(r'\s+', ' ', text)
     return text
 
-
-def extract_boxed_text(text):
-    pattern = r'oxed{(.*?)}'
-    matches = re.findall(pattern, text)
-    if not matches:
-        return ""
-    for match in matches[::-1]:
-        if match != "":
-            return match
-    return ""
-
-
 def calculate_accuracy(model, tokenizer, loader):
     """
     Calculates prediction accuracy on a dataset.
@@ -226,12 +213,8 @@ def calculate_accuracy(model, tokenizer, loader):
                 # Generate model's prediction for this prompt
                 generated_text = generate_text(model, tokenizer, prompt)
                 # Compare normalized versions of prediction and expected completion
-                generated_result = extract_boxed_text(generated_text)
-                expected_result = extract_boxed_text(expected_completion)
-                if generated_result == expected_result:
+                if normalize_text(generated_text) == normalize_text(expected_completion):
                     correct += 1
-                # if normalize_text(generated_text) == normalize_text(expected_completion):
-                    # correct += 1
                 total += 1
 
     # Calculate accuracy, handling empty dataset case
@@ -253,39 +236,20 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=50):
     Returns:
         str: Generated completion
     """
-    # # Encode prompt and move to model's device
-    # input_ids = tokenizer(prompt, return_tensors="pt").to(model.device)
-
-    # 根据模型类型获取设备
-    if isinstance(model, torch.nn.DataParallel):
-        device = next(model.module.parameters()).device
-    else:
-        device = next(model.parameters()).device
-    input_ids = tokenizer(prompt, return_tensors="pt").to(device)
+    # Encode prompt and move to model's device
+    input_ids = tokenizer(prompt, return_tensors="pt").to(model.device)
 
     # Generate completion using model
-    if isinstance(model, torch.nn.DataParallel):
-        output_ids = model.module.generate(
-            input_ids=input_ids["input_ids"],
-            attention_mask=input_ids["attention_mask"],
-            max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=False,        # Use KV cache for faster generation
-            num_beams=1,           # Use greedy decoding
-            do_sample=False,       # Don't use sampling
-        )[0]
-    else:
-        output_ids = model.generate(
-            input_ids=input_ids["input_ids"],
-            attention_mask=input_ids["attention_mask"],
-            max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=True,        # Use KV cache for faster generation
-            num_beams=1,           # Use greedy decoding
-            do_sample=False,       # Don't use sampling
-        )[0]
+    output_ids = model.generate(
+        input_ids=input_ids["input_ids"],
+        attention_mask=input_ids["attention_mask"],
+        max_new_tokens=max_new_tokens,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        use_cache=True,        # Use KV cache for faster generation
+        num_beams=1,           # Use greedy decoding
+        do_sample=False,       # Don't use sampling
+    )[0]
 
     # Extract and decode only the generated part (excluding prompt)
     generated_text = decode_text(tokenizer, output_ids[input_ids["input_ids"].shape[1]:])
@@ -305,13 +269,6 @@ def test_model(model_path, test_input):
 
     # Load saved model and move to appropriate device
     model = AutoModelForCausalLM.from_pretrained(model_path).to(device)
-
-    if torch.cuda.device_count() > 1:
-        print('--------------------------------HAHAHA--------------------------------')
-        model = torch.nn.DataParallel(model)
-        # model.to(device)
-    
-
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     # Ensure model has proper padding token configuration
@@ -395,15 +352,15 @@ def download_and_prepare_data(url, tokenizer, batch_size, test_ratio=0.1):
             answer = int(answer) % 1000
             answer = str(answer)
         except:
-            # logging.error(f"Error in answer: {answer}")
+            logging.error(f"Error in answer: {answer}")
             
-            # print("====================================")
-            # print(answer.isdigit())
-            # print(type(answer))
-            # print('answer:', answer)
-            # print(entry["prompt"])
-            # print(type(entry["think"]))
-            # print(type(entry["answer"]))
+            print("====================================")
+            print(answer.isdigit())
+            print(type(answer))
+            print('answer:', answer)
+            print(entry["prompt"])
+            print(type(entry["think"]))
+            print(type(entry["answer"]))
             continue
 
         if not isinstance(entry['prompt'], str):
@@ -462,7 +419,7 @@ def get_hyperparameters():
     # Training for 2 epochs as a balance of learning and efficiency
     num_epochs = 2
     # Batch size of 16 works well with most GPU memory sizes
-    batch_size = 32
+    batch_size = 2
     # Standard learning rate for fine-tuning transformers
     learning_rate = 5e-5
 
@@ -497,24 +454,16 @@ if __name__ == "__main__":
     accuracies = []
     batches = []
 
-    # 初始化 GradScaler
-    scaler = GradScaler()
-
-    torch.backends.cuda.enable_flash_sdp(True)  # 启用FlashAttention（如果可用）
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-
-
 
     # Set random seeds for reproducibility
     set_seed(42)
 
     # Configure basic training parameters
     # Configure training parameters
-    # model_name = "DeepSeek-R1-Distill-Qwen-7B"
-    model_name = "gpt2"
+    model_name = "DeepSeek-R1-Distill-Qwen-7B"
 
     is_soretd = False
-    if not is_soretd:
+    if is_soretd:
         train_url = "math_data/V1_filtered/train_data_filtered.jsonl"
         test_large_url = "math_data/V1_filtered/test_large_data_filtered.jsonl"
         test_small_url = "math_data/V1_filtered/test_small_data_filtered.jsonl"
@@ -523,39 +472,15 @@ if __name__ == "__main__":
         test_large_url = "math_data/V2_sorted/test_large_data_filtered_sorted.jsonl"
         test_small_url = "math_data/V2_sorted/test_small_data_filtered_sorted.jsonl"
 
-    train_url = "math_data/train.jsonl"
-    test_large_url = "math_data/train.jsonl"
-    test_small_url = "math_data/train.jsonl"
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load pre-trained model and move to appropriate device
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,  # 使用 float16 数据类型
-        device_map=None,
-        trust_remote_code=True  # 信任远程模型代码
-    ).to(device)
-
-    if torch.cuda.device_count() > 1:
-        print('--------------------------------HAHAHA--------------------------------')
-        model = torch.nn.DataParallel(model, device_ids=[0, 1])
-        print(next(model.parameters()).device)  # 应输出 "cuda:0"
-        print(torch.cuda.memory_allocated(0))  # 查看 GPU 0 显存占用
-        print(torch.cuda.memory_allocated(1))  # 查看 GPU 1 显存占用
-    
-    # model.to(device)
-
     # Initialize tokenizer and configure padding token
-    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
     # Load pre-trained model and move to appropriate device
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
-    # 启用梯度检查点
-    model.gradient_checkpointing_enable()
-    model = torch.nn.DataParallel(model, device_ids=[0,1])  # 使用 DataParallel 包装模型
 
 
     # Get training hyperparameters
@@ -586,19 +511,17 @@ if __name__ == "__main__":
             labels = labels.to(device)
 
             # Forward pass with loss calculation
-            with autocast():
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
-                loss = outputs.loss.mean()
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+            loss = outputs.loss
 
-            # Backward pass and optimization with GradScaler
-            scaler.scale(loss).backward()  # 缩放梯度
-            scaler.step(optimizer)         # 更新参数
-            scaler.update()                # 更新缩放因子
-            optimizer.zero_grad()          # 清空梯度
+            # # Backward pass and optimization
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
 
             # Update progress metrics
             total_loss += loss.item()
@@ -609,10 +532,7 @@ if __name__ == "__main__":
                 print(f"Epoch {epoch+1} Batch {num_batches} - Loss: {loss.item():.4f}, Test Small accuracy: {test_small_acc:.4f}")
                 checkpoint_path = f"finetuned_model/deepseek-sft/{epoch+1}_{num_batches}"
                 os.makedirs(checkpoint_path, exist_ok=True)
-                if isinstance(model, torch.nn.DataParallel):
-                    model.module.save_pretrained(checkpoint_path)
-                else:
-                    model.save_pretrained(checkpoint_path)
+                model.save_pretrained(checkpoint_path)
                 tokenizer.save_pretrained(checkpoint_path)
 
                 # 保存损失和准确率数据
@@ -640,10 +560,7 @@ if __name__ == "__main__":
     # Save the trained model and tokenizer
     final_checkpoint_path = "finetuned_model/deepseek-sft/final"
     os.makedirs(final_checkpoint_path, exist_ok=True)
-    if isinstance(model, torch.nn.DataParallel):
-        model.module.save_pretrained(checkpoint_path)
-    else:
-        model.save_pretrained(checkpoint_path)
+    model.save_pretrained(final_checkpoint_path)
     tokenizer.save_pretrained(final_checkpoint_path)
 
     # 显示最终图像
