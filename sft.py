@@ -16,7 +16,14 @@ from torch.cuda.amp import GradScaler, autocast  # 用于混合精度训练
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 SYSTEM_PROMPT = """
-You are a helpful and harmless assistant. You are Qwen developed by Alibaba. You should think step-by-step. You should output in a format similar to <think>...</think><answer>...</answer>, where <think> contains the reasoning process and <answer> contains the final answer. Return final answer within \\boxed{}, after taking modulo 1000. 
+You are a helpful and harmless assistant. You are Qwen developed by Alibaba. You should think step-by-step. You should output in a format similar to <think>...</think><answer>...</answer>, where <think> contains the reasoning process and <answer> contains the final answer. Return final answer within \\boxed{{}}, after taking modulo 1000.
+
+Here we give some examples:
+    question: What is the greatest value that the sum $S_\{n\}$ of the first $n$ terms of an arithmetic progression can take, given that the sum $S_{3}=327$ and the sum $S_{57}=57$?, 
+    answer: <think> Solution:\n\nIf $a-$ is the first term and $d-$ is the common difference of the arithmetic progression,\n\n$\\left\\{\\begin{array}{l}\\frac{a+a+2 d}{2} \\cdot 3=327, \\\\ \\frac{a+a+56 d}{2} \\cdot 57=57\\end{array} \\Leftrightarrow\\left\\{\\begin{array}{l}a+d=109, \\\\ a+28 d=1\\end{array} \\Rightarrow 27 d=-108 ; d=-4, a=113\\right.\\right.$.\n\nThe sum of the first $n$ terms of the arithmetic progression $S_{n}$ reaches its maximum value if $a_{n}>0$, and $a_{n+1} \\leq 0$. Since $a_{n}=a+d(n-1)$, from the inequality $113-4(n-1)>0$ we find $n=[117 / 4]=29$. Then $\\max S_{n}=S_{29}=0.5 \\cdot(113+113-4 \\cdot 28) \\cdot 29=1653 . \\quad$ </think>
+    <answer>1653, so the answer mod 1000 is \\boxed{653} </answer>
+
+Question:
 """
 
 def set_seed(seed):
@@ -198,6 +205,84 @@ def extract_boxed_text(text):
             return match
     return ""
 
+#################################### multi processing inference ##########################################
+
+def calculate_accuracy_batch(model, tokenizer, loader):
+    """
+    Calculates prediction accuracy on a dataset.
+
+    Args:
+        model: Fine-tuned model
+        tokenizer: Associated tokenizer
+        loader: DataLoader containing evaluation examples
+
+    Returns:
+        float: Accuracy score
+    """
+    # Set model to evaluation mode (disables dropout, etc.)
+    model.eval()
+    correct = 0
+    total = 0
+
+    # Disable gradient computation for efficiency
+    with torch.no_grad():
+        for input_ids, attention_mask, labels, prompts, expected_completions in loader:
+            # Batch encode prompts
+            device = next(model.parameters()).device
+            input_ids = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+
+            # Generate predictions for the entire batch
+            if isinstance(model, torch.nn.DataParallel):
+                output_ids = model.module.generate(
+                    input_ids=input_ids["input_ids"],
+                    attention_mask=input_ids["attention_mask"],
+                    max_new_tokens=2048,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    num_beams=1,
+                    do_sample=False
+                )
+            else:
+                print('len of input_ids:', len(input_ids["input_ids"]))
+                output_ids = model.generate(
+                    input_ids=input_ids["input_ids"],
+                    attention_mask=input_ids["attention_mask"],
+                    max_new_tokens=2048,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    num_beams=1,
+                    do_sample=False
+                )
+
+            # Decode the generated outputs
+            generated_texts = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+
+            # Compare results
+            for generated_text, expected_completion in zip(generated_texts, expected_completions):
+                generated_result = extract_boxed_text(generated_text)
+                expected_result = extract_boxed_text(expected_completion)
+                
+                DEBUG = False  # 设置为 True 以启用调试打印
+
+                if DEBUG:
+                    print("=" * 50)
+                    print("generated_text:", generated_text)
+                    print("generated_result:", generated_result)
+                    print("expected_result:", expected_result)
+                
+                if generated_result == expected_result:
+                    correct += 1
+                total += 1
+
+    # Calculate accuracy
+    accuracy = correct / total if total > 0 else 0
+    model.train()
+    return accuracy
+
+##########################################################################################################
+
+
+
 
 def calculate_accuracy(model, tokenizer, loader):
     """
@@ -240,7 +325,7 @@ def calculate_accuracy(model, tokenizer, loader):
     model.train()
     return accuracy
 
-def generate_text(model, tokenizer, prompt, max_new_tokens=50):
+def generate_text(model, tokenizer, prompt, max_new_tokens=2048):
     """
     Generates text completion for a given prompt.
 
@@ -462,7 +547,7 @@ def get_hyperparameters():
     # Training for 2 epochs as a balance of learning and efficiency
     num_epochs = 2
     # Batch size of 16 works well with most GPU memory sizes
-    batch_size = 32
+    batch_size = 16
     # Standard learning rate for fine-tuning transformers
     learning_rate = 5e-5
 
