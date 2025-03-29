@@ -1,7 +1,7 @@
 from peft import get_peft_model, LoraConfig, TaskType  # 引入 PEFT 库
 import deepspeed
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments, DataCollatorForSeq2Seq
 from datasets import load_dataset, Features, Value, Dataset, DatasetDict
 from sft import read_jsonl_file
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -61,7 +61,7 @@ tokenizer.pad_token = tokenizer.eos_token
 #     return tokenized
 
 # 数据预处理函数
-def tokenize_function(examples, max_length=512):
+def tokenize_function(examples, max_length=2048):
     # 将 prompt 和 answer 拼接为输入
     prompts = [ SYSTEM_PROMPT + "\n" + example for example in examples["prompt"] ]
     answers = []
@@ -105,11 +105,80 @@ def tokenize_function(examples, max_length=512):
     return tokenized
 
 # 预处理数据集
-tokenized_datasets = dataset.map(tokenize_function, batched=True)
+# tokenized_datasets = dataset.map(tokenize_function, batched=True)
 
 # train_dataset = download_and_prepare_data("math_data/V1_filtered/train_data_filtered.jsonl", tokenizer=tokenizer, batch_size=4).dataset
 # val_dataset = download_and_prepare_data("math_data/V1_filtered/test_small_data_filtered.jsonl", tokenizer=tokenizer, batch_size=4).dataset
 # tokenized_datasets = {"train": train_dataset, "validation": val_dataset}
+
+##############################
+# 得到训练集
+def process_func(example):
+    """
+    将数据集进行预处理
+    """
+    MAX_LENGTH = 2048
+    input_ids, attention_mask, labels = [], [], []
+    instruction = tokenizer(
+        f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{example['prompt']}<|im_end|>\n<|im_start|>assistant\n",
+        add_special_tokens=False,
+        truncation=True,
+        padding="max_length",
+        max_length=MAX_LENGTH
+    )
+    think = example['think']
+    answer = example['answer']
+    try:
+        answer_mod = int(answer) % 1000
+    except Exception:
+        answer_mod = 0
+    
+    response = tokenizer(f"<think>{think}</think>\n" \
+                f"<answer>{answer}. So the mod 1000 answer is \\boxed{{{str(answer_mod)}}}</answer>", 
+                add_special_tokens=False,
+                truncation=True, 
+                padding="max_length",
+                max_length=MAX_LENGTH
+            )
+    input_ids = (
+        instruction["input_ids"] + response["input_ids"] + [tokenizer.pad_token_id]
+    )
+    attention_mask = instruction["attention_mask"] + response["attention_mask"] + [1]
+    labels = (
+        [-100] * len(instruction["input_ids"])
+        + response["input_ids"]
+        + [tokenizer.pad_token_id]
+    )
+    if len(input_ids) > MAX_LENGTH:  # 做一个截断
+        input_ids = input_ids[:MAX_LENGTH]
+        attention_mask = attention_mask[:MAX_LENGTH]
+        labels = labels[:MAX_LENGTH]
+
+    # 确保返回值是整数列表
+    assert all(isinstance(x, int) for x in input_ids), "input_ids 包含非整数值"
+    assert all(isinstance(x, int) for x in attention_mask), "attention_mask 包含非整数值"
+    assert all(isinstance(x, int) for x in labels), "labels 包含非整数值"
+    assert len(input_ids) == len(attention_mask), "input_ids 和 attention_mask 长度不一致"
+    assert len(input_ids) == len(labels), "input_ids 和 labels 长度不一致"
+
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+# tokenized_datasets = dataset.map(process_func, remove_columns=dataset["train"].column_names)
+# print("keys in dataset: ", dataset["train"].keys())
+# print("keys in tokenized_datasets: ", tokenized_datasets["train"].keys())
+
+train_dataset = train_data.map(process_func, remove_columns=train_data.column_names)
+val_dataset = val_data.map(process_func, remove_columns=val_data.column_names)
+tokenized_datasets = DatasetDict({"train": train_dataset, "validation": val_dataset})
+
+
+for sample in tokenized_datasets["train"]:
+    assert isinstance(sample["input_ids"], list), f"Invalid input_ids format: {sample['input_ids']}"
+    assert len(sample["input_ids"]) <= 2048, f"Sample too long: {len(sample['input_ids'])}"
+##############################
+
+
+
 
 # 设置训练参数
 training_args = TrainingArguments(
@@ -126,12 +195,20 @@ training_args = TrainingArguments(
     remove_unused_columns=False
 )
 
+data_collator = DataCollatorForSeq2Seq(
+    tokenizer=tokenizer,
+    padding="max_length",  # 启用填充
+    max_length=2048,  # 最大长度
+    return_tensors="pt",  # 返回 PyTorch 张量
+)
+
 # 定义 Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_datasets["train"],
-    eval_dataset=tokenized_datasets["validation"]
+    eval_dataset=tokenized_datasets["validation"],
+    data_collator=data_collator,
 )
 
 # 启动训练
